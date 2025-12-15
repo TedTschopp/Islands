@@ -1,0 +1,681 @@
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Procedural Island</title>
+	<style>
+		:root { color-scheme: light; }
+		body {
+			margin: 16px;
+			font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+			line-height: 1.35;
+		}
+		#hud {
+			display: flex;
+			gap: 12px;
+			align-items: baseline;
+			flex-wrap: wrap;
+		}
+		#mouse_elevation {
+			position: fixed;
+			z-index: 1;
+			white-space: pre;
+			padding: 6px 8px;
+			border-radius: 8px;
+			background: rgba(0,0,0,0.78);
+			color: rgba(255,255,255,0.96);
+			font-size: 12px;
+			line-height: 1.25;
+			pointer-events: none;
+		}
+		#map_canvas {
+			display: block;
+			background: #000;
+			max-width: 100%;
+			height: auto;
+		}
+		#controls {
+			margin-top: 12px;
+		}
+		#controls ul {
+			margin: 8px 0 0 0;
+			padding-left: 18px;
+		}
+		#controls li { margin: 4px 0; }
+		kbd {
+			font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+			font-size: 0.95em;
+			padding: 0 0.35em;
+			border: 1px solid rgba(0,0,0,0.2);
+			border-bottom-width: 2px;
+			border-radius: 6px;
+			background: rgba(0,0,0,0.04);
+		}
+	</style>
+</head>
+<body>
+	<header id="hud" aria-label="Simulation readouts">
+		<output id="date_readout">---</output>
+		<output id="low_readout">---</output>
+	</header>
+	<div id="mouse_elevation" aria-live="polite"></div>
+
+	<main>
+		<canvas id="map_canvas">
+			Your browser does not support HTML canvas.
+		</canvas>
+	</main>
+<!--<canvas id="river_canvas" style = "position: absolute; z-index: 1;  background-color:transparent;">
+</canvas>-->
+	<section id="controls" aria-labelledby="controls-title">
+		<h2 id="controls-title">Controls</h2>
+		<fieldset aria-label="Hex grid overlays">
+			<legend>Hex grids</legend>
+			<label>
+				<input type="checkbox" id="toggle_adventure_hex" checked>
+				Adventure Grid (1 mile)
+			</label>
+			<label>
+				<input type="checkbox" id="toggle_overland_hex" checked>
+				Overland Hex Grid
+			</label>
+			<select id="select_overland_hex_size" aria-label="Overland hex size">
+				<option value="5" selected>5 miles</option>
+				<option value="6">6 miles</option>
+				<option value="8">8 miles</option>
+				<option value="10">10 miles</option>
+				<option value="12">12 miles</option>
+			</select>
+			<label>
+				<input type="checkbox" id="toggle_kingdom_hex" checked>
+				Kingdom Hex Grid
+			</label>
+			<select id="select_kingdom_hex_size" aria-label="Kingdom hex size">
+				<option value="25">25 miles</option>
+				<option value="30" selected>30 miles</option>
+				<option value="40">40 miles</option>
+				<option value="50">50 miles</option>
+				<option value="60">60 miles</option>
+			</select>
+		</fieldset>
+		<ul>
+			<li><kbd>1</kbd> = 50k years/step (fast), <kbd>2</kbd> = 20k years/step, <kbd>3</kbd> = 5k years/step (slow)</li>
+			<li><kbd>,</kbd> / <kbd>.</kbd> = halve / double timestep</li>
+			<li><kbd>Space</kbd> = run steps using the current step size (hold to keep stepping)</li>
+			<li><kbd>S</kbd> = toggle sea-level changes (when off, sea level stays fixed)</li>
+			<li><kbd>G</kbd> = cycle overlays (terrain &rarr; +coastlines &rarr; +rivers)</li>
+			<li><kbd>P</kbd> = pause/resume stepping</li>
+			<li><kbd>R</kbd> = re-randomize and restart (new terrain + uplift field)</li>
+			<li><kbd>D</kbd> = dump debug info for hovered cell (console)</li>
+			<li><kbd>Mouse</kbd> = hover to see cell id + elevation readout</li>
+		</ul>
+		<p><em>Tip:</em> pressing any key stops the initial auto-run; press <kbd>R</kbd> to restart.</p>
+	</section>
+
+	<noscript>
+		<p>This demo requires JavaScript enabled.</p>
+	</noscript>
+
+
+
+<script src="noise.js"></script>
+<script src="utilities.js"></script>
+<script src="voronoi.js"></script>
+
+
+<script>
+"use strict";
+
+// DOM elements (avoid relying on legacy "id -> window variable" behavior)
+const mapCanvas = document.getElementById("map_canvas");
+const mouseElevationEl = document.getElementById("mouse_elevation");
+const dateReadoutEl = document.getElementById("date_readout");
+const lowReadoutEl = document.getElementById("low_readout");
+const overlandHexToggleEl = document.getElementById("toggle_overland_hex");
+const kingdomHexToggleEl = document.getElementById("toggle_kingdom_hex");
+const adventureHexToggleEl = document.getElementById("toggle_adventure_hex");
+const overlandHexSizeEl = document.getElementById("select_overland_hex_size");
+const kingdomHexSizeEl = document.getElementById("select_kingdom_hex_size");
+
+/*
+Procedural Island — main entrypoint
+
+This file wires together:
+- Voronoi mesh construction (`create_voronoi_tiling` from `voronoi.js`)
+- Simulation state arrays (bedrock/sediment/water)
+- Drainage + erosion (`initialize_drainage`, `calculate_drainage_graph`, `run_drainage` from `drainage.js`)
+- Rendering (`draw_mesh`, `draw_coastlines`, `draw_rivers` from `webgl.js`)
+
+If you want to tune "settings" or add workflow steps, start here:
+- Parameters/constants are declared near the top of this script block.
+- The per-step pipeline is in `step(dt)`.
+- The draw pipeline is in `render()`.
+
+Units/conventions used throughout:
+- Horizontal: `cell_x/cell_y` are in canvas pixel coordinates.
+- `pixel_length` converts pixel distance → meters.
+- Vertical: elevations/thicknesses are treated as meters.
+- Time: `dt` is years.
+*/
+
+create_voronoi_tiling(256, 256, 4, 0, 3);
+
+
+let bedrock_thickness = new Float32Array(cell_count);
+let sediment_thickness = new Float32Array(cell_count);
+let lake_thickness = new Float32Array(cell_count);
+let cell_elevation = new Float32Array(cell_count);
+let uplift_array = new Float32Array(cell_count);
+let erodibility = new Float32Array(cell_count);
+
+// ---------------------------------------------------------------------------
+// Simulation parameters (primary knobs)
+//
+// Notes:
+// - Most physics parameters are used in `run_drainage(dt)` (see `drainage.js`).
+// - Most display parameters are used in `render()` and `webgl.js`.
+// ---------------------------------------------------------------------------
+
+const km3 = 1000*1000*1000;
+const pixel_length = 250; // meters per pixel (controls horizontal scale)
+
+// Vertical datum / sea level
+const mean_sea_level = 2000; // meters (baseline)
+
+// Hydrology
+const rainfall = 0.3; // meters/year (multiplied by cell area to produce volume)
+
+// Erosion / sediment transport (see `run_drainage` in `drainage.js`)
+// These are "tuning" parameters rather than physically rigorous values.
+const sediment_erosion_distance = 60000; // meters (legacy; currently not used)
+const bedrock_erosion_distance = 120000; // meters (legacy; currently not used)
+const fluvial_transport_coefficient = 60; // controls sediment transport capacity
+const sedimentation_distance = 25000; // meters (controls how quickly excess sediment deposits)
+const sediment_density = 2200; // kg/m^3
+const landscape_diffusion_coefficient = 2; // applied in limited underwater/coastal cases
+let time = 0;
+let timestep = 50000; // years per step when manually running
+/* Knickpoint retreat of 0.2-2mm/year, say 1mm.
+   Implies 4km (~one cell) in 4Ma.
+   --too slow */
+const lake_threshold = 5; // meters: treat water thinner than this as "dry" for rendering
+
+</script>
+
+<script src="webgl.js"></script>
+<script src="drainage.js"></script>
+
+<script>
+
+//setup_canvas(river_canvas);
+//render_voronoi();
+//render_delauney();
+
+let sea_level = mean_sea_level;
+
+// UI / debug toggles
+let paused = false;
+// 0: terrain only, 1: +coastlines, 2: +coastlines + rivers
+let overlay_mode = 2;
+let show_overland_hex_grid = true;
+let show_kingdom_hex_grid = true;
+
+let overland_hex_miles = 5;
+let kingdom_hex_miles = 30;
+
+let show_adventure_hex_grid = true;
+const adventure_hex_miles = 1;
+
+if (overlandHexToggleEl)
+{
+	show_overland_hex_grid = overlandHexToggleEl.checked;
+	overlandHexToggleEl.addEventListener("change", () =>
+	{
+		show_overland_hex_grid = overlandHexToggleEl.checked;
+		render();
+	});
+}
+
+if (overlandHexSizeEl)
+{
+	overland_hex_miles = Number(overlandHexSizeEl.value) || overland_hex_miles;
+	overlandHexSizeEl.addEventListener("change", () =>
+	{
+		overland_hex_miles = Number(overlandHexSizeEl.value) || overland_hex_miles;
+		render();
+	});
+}
+
+if (kingdomHexToggleEl)
+{
+	show_kingdom_hex_grid = kingdomHexToggleEl.checked;
+	kingdomHexToggleEl.addEventListener("change", () =>
+	{
+		show_kingdom_hex_grid = kingdomHexToggleEl.checked;
+		render();
+	});
+}
+
+if (kingdomHexSizeEl)
+{
+	kingdom_hex_miles = Number(kingdomHexSizeEl.value) || kingdom_hex_miles;
+	kingdomHexSizeEl.addEventListener("change", () =>
+	{
+		kingdom_hex_miles = Number(kingdomHexSizeEl.value) || kingdom_hex_miles;
+		render();
+	});
+}
+
+if (adventureHexToggleEl)
+{
+	show_adventure_hex_grid = adventureHexToggleEl.checked;
+	adventureHexToggleEl.addEventListener("change", () =>
+	{
+		show_adventure_hex_grid = adventureHexToggleEl.checked;
+		render();
+	});
+}
+//canvas.style.transform = "scale(0.75)";
+setup_initial_relief();
+setup_uplift();
+fill_lakes();
+initialize_drainage();
+calculate_drainage_graph();
+render();
+
+function reset_simulation()
+{
+	// Re-randomize terrain + uplift and restart the sim clock.
+	// Note: this intentionally does NOT rebuild the Voronoi mesh; it rebuilds
+	// the fields that depend on randomness (relief/uplift) and all derived state.
+	time = 0;
+	sea_level = mean_sea_level;
+	paused = false;
+	auto_run = true;
+	animate_toggle = false;
+	setup_initial_relief();
+	setup_uplift();
+	fill_lakes();
+	initialize_drainage();
+	calculate_drainage_graph();
+	render();
+}
+
+// One-time initialization order above is intentional:
+// 1) create terrain (bedrock/sediment)
+// 2) set uplift field
+// 3) optionally pre-fill lakes (adds sediment into basins)
+// 4) build initial drainage graph
+// 5) draw
+
+var t0 = performance.now();
+//for (let i=0; i<30; i++) {step(timestep);}
+var t1 = performance.now();
+console.log(((t1 - t0)/30).toFixed(0) + " milliseconds.");
+
+
+function setup_initial_relief()
+{
+	var shape = new SNoise(500, 400, -45+Math.random()*90); //-45);
+	shape.octaves(6, 0.5);
+	var chunks = new SNoise(500, 300, -45+Math.random()*90); //-45);
+	chunks.octaves(6, 0.8);
+	var surface = new SNoise(500, 300, -45+Math.random()*90); //45);
+	surface.octaves(5, 0.6);
+	var noise1 = new SNoise(500);
+	noise1.octaves(2, 0.6);
+	//var rifting = new SNoise(600, 200, -30+Math.random()*60);
+	var rifting = new SNoise(200, 50, -30+Math.random()*60);
+	rifting.octaves(4, 0.6);
+
+	var mountain = new SNoise(4000, 2400, 90);
+	mountain.octaves(10, 0.6);
+	let slope_s = 0.1*(Math.random()-0.5);
+	let slope_t = 0.1*(Math.random()-0.5);
+
+	for (let cell=0; cell<cell_count; cell++)
+	{
+		bedrock_thickness[cell]=0;
+		sediment_thickness[cell]=0;
+		lake_thickness[cell]=0;
+        erodibility[cell] = 0.5 + Math.random();
+		let x = cell_x[cell];
+        let y = cell_y[cell];
+
+
+		var s = (x/pixel_width)*2-1;
+		var t = (y/pixel_width)*2-1;
+		var x_km = 2*x*pixel_length/1000;
+		var y_km = 2*y*pixel_length/1000;
+		var h=0;
+
+		var r = 2*(rifting.get(x_km + noise1.get(2*x_km, 2*y_km)*60, y_km)+0.4);
+		if (r>0) r *= -10;
+		else r=r*2000;
+
+		if (noise1.get(0.5*x_km, 0.5*y_km+10000000) + 0.1*noise1.get(3*x_km+30000, 3*y_km)>0)
+		{
+			x_km += 400;
+			y_km -= 400;
+		}
+
+		var e = 1.3*(s*s + t*t)+ 0.8*shape.get(x_km, y_km);
+		e = 0.7-e;
+		e = Math.min(e,s*slope_s + t*slope_t);
+		e *= 5;
+		h += 2100*(1+e);
+		h += r*0.6;
+
+		if (h>=600)
+		{
+	      h += Math.max(chunks.get(x_km + 99999 + noise1.get(x_km+45345.354, y_km + 45.234) * 200, y_km + noise1.get(x_km, y_km+20000)*200) * 1000, -10);
+			h += shape.get(x_km*10, y_km*10)*100;
+			h += Noise.simplex2(x/10, y/10)*20;
+			h += Math.random()*1;
+		}
+
+		if (h<600) h = 600;
+
+      bedrock_thickness[cell] = h;
+      sediment_thickness[cell] += Math.random();
+		if (shape.get(x, y)<0) { bedrock_thickness[cell]-=100; sediment_thickness[cell] +=200;}
+	}
+}
+
+function setup_uplift()
+{
+	for (let cell=0; cell<cell_count; cell++)
+	{
+		let x = cell_x[cell];
+		let y = cell_y[cell];
+
+      let s = (x/pixel_width)*2 -1;
+      var t = (y/pixel_width)*2-1;
+      let d=0;
+      d += compression(x/2, y/2+100*Noise.simplex2(0.45*s,0*0.5*t+6055)+50*Noise.simplex2(s+4,0*t+4) + 18*Noise.simplex2(s*2+100, t*2+1034) + 5 * Noise.simplex2(x/30, y/30), 0);
+      d += compression(x/2+y/2,x/2-y/2,1000) * 0.2;
+      d += Noise.simplex2(x/4, y/4)*20;
+      d += Math.random()*20;
+      d*= Math.max(2*Noise.simplex2(0.5*s+100, 1.6*t+200)+Noise.simplex2(3*s+200, 5*t+400)*0.5, 0);
+      d *= 0.5*(t+1);
+
+      d += Noise.simplex2(0.5*s+50.3, 0.5*t+100.7)*100; //long wavelength change
+
+      uplift_array[cell] = d/1600;
+	}
+}
+
+function setup_test_uplift()
+{
+	for (let cell=0; cell<cell_count; cell++)
+	{
+		let x = cell_x[cell];
+		let y = cell_y[cell];
+
+		let xx = (x-500)/200;
+		let yy = (y-500)/200;
+		let d = 1-Math.sqrt(xx*xx+yy*yy);
+		//d += (0.2*Noise.simplex2(x/50, y/50))+ 0.3*Noise.simplex2(x/120, y/100) + 0.4*Noise.simplex2(x/250, y/200);
+      if (d<0) d = 0;
+		uplift_array[cell] = 2*d;
+		/*if ((x>200 && x<700) && (y>300 && y<500))
+		{
+			uplift_array[cell] = 2;// -20* Math.abs(y-400);
+		}*/
+	}
+}
+
+function uplift(dt)
+{
+	for (let cell = 0; cell < cell_count; cell++)
+   {
+	   let x = cell_x[cell];
+	   let y = cell_y[cell];
+		if (cell_elevation[cell] < 1500) continue;
+		//var h = uplift_array[cell]*dt*0.000004;
+		let h = uplift_array[cell] * 0.001*dt; //uplift is in mm/year
+		bedrock_thickness[cell] += h;
+	}
+}
+
+function compression(x,y, noise_offset)
+{
+  var e =Noise.simplex2(x/1000+noise_offset, y/160+noise_offset)*y*(pixel_height-y)*1.3/pixel_height;
+  e += Noise.simplex2(x/400-6+noise_offset, y/60+7+noise_offset)*y*(pixel_height-y)/pixel_height;
+  e += Noise.simplex2(x/140-9+noise_offset, y/20+20+noise_offset)*y*(pixel_height-y)*0.8/pixel_height;
+  if (e<0) e*=0.2;
+  return e;
+}
+
+function setup_test_initial_relief()
+{
+    let bumps = new SNoise(300, 800, 45+Math.random()*90);
+	 let twist = new SNoise(600);
+    twist.octaves(2);
+    let form = new SNoise(900, 900);
+    form.octaves(5);
+    bumps.octaves(7, 0.6);
+    for (let cell=0; cell<cell_count; cell++)
+    {
+      bedrock_thickness[cell]=0;
+      sediment_thickness[cell]=0;
+      lake_thickness[cell]=0;
+		erodibility[cell] = 0.75+0.5*Math.random();
+      let x = cell_x[cell];
+      let y = cell_y[cell];
+      if (x <200) bedrock_thickness[cell] = 0;
+		else if (x<300) bedrock_thickness[cell] = 3100*(x-200)/100;
+      else bedrock_thickness[cell] = 3100 + 10*Math.random();
+
+      /*let rift = (form.get(x,y) + 2*x/pixel_width-0.5)*2;
+      rift = Math.min(1, Math.max(rift, 0));
+      if (form.get(y+20130, x-23982)<0) y=y+4000;
+
+      bedrock_thickness[cell] = rift*Math.max(2150,
+				(2000+1000*bumps.get(x+100*twist.get(x,y), y + 200*twist.get(y/2, x/2))+0.5*x)); //10*Math.random();
+
+      y = cell
+
+      _y[cell];
+		if (y<30) bedrock_thickness[cell] += 120-4*y;
+		if (y>pixel_height-30) bedrock_thickness[cell] += 4*(y - pixel_height+30);
+      bedrock_thickness[cell] += Math.random()*2;*/
+    }
+}
+
+function old_setup_uplift()
+{
+   let bumps = new SNoise(30, 10, 25);
+   bumps.octaves(7, 0.6);
+	for (let cell = 0; cell < cell_count; cell++)
+   {
+      uplift_array[cell] = 0.5*bumps.get(cell_x[cell], cell_y[cell]);
+      uplift_array[cell] += 0.1*Math.random();
+   }
+}
+
+
+
+
+
+let change_sea_level = true;
+function step(dt)
+{
+	// Core simulation pipeline (dt is years)
+	//
+	// Extension points:
+	// - Add terrain-modifying processes before `initialize_drainage()` so that
+	//   the new topography affects the next drainage solve.
+	// - Add post-processes after `run_drainage(dt)` if they depend on discharge
+	//   or if you want them applied after erosion/deposition.
+	time += dt;
+   if (time>2000000 && change_sea_level) sea_level = mean_sea_level + 50 * Math.sin(2*Math.PI*time / 500000);
+   if (time>500000 && change_sea_level) uplift(dt);
+   initialize_drainage();
+   calculate_drainage_graph();
+   run_drainage(dt);
+   render();
+}
+
+function render()
+{
+	// Rendering is decoupled from simulation. If you are experimenting with
+	// new fields (e.g. vegetation, temperature), add new draw calls here.
+   //draw_GL_relief();
+	draw_mesh(cell_elevation);
+	if (overlay_mode >= 1) draw_coastlines(1);
+	if (overlay_mode >= 2) draw_rivers(0.01*km3, 2*km3, 1);
+	// Hex grid overlays drawn on top.
+	// Opacity is 0..255 (alpha = opacity/255).
+	if (show_adventure_hex_grid) draw_hex_grid(adventure_hex_miles, 24, 1);
+	if (show_overland_hex_grid) draw_hex_grid(overland_hex_miles, 32, 1);
+	if (show_kingdom_hex_grid) draw_hex_grid(kingdom_hex_miles, 48, 2);
+}
+
+function debug_hovered_cell()
+{
+	let cell = get_nearest_cell(mouse_x, mouse_y);
+	if (cell === -1) { console.log("No cell under mouse."); return; }
+	let elevation = bedrock_thickness[cell] + sediment_thickness[cell];
+	let water = lake_thickness[cell];
+	let downstream0 = best_neighbours ? best_neighbours[cell*2] : undefined;
+	let downstream1 = best_neighbours ? best_neighbours[cell*2+1] : undefined;
+	console.log({
+		cell,
+		time_Ma: +(time/1_000_000).toFixed(3),
+		bedrock_m: +bedrock_thickness[cell].toFixed(2),
+		sediment_m: +sediment_thickness[cell].toFixed(2),
+		elevation_m: +elevation.toFixed(2),
+		lake_thickness_m: +water.toFixed(2),
+		sea_level_m: sea_level,
+		downstream0,
+		downstream1,
+		in_degree: (typeof in_degree !== "undefined") ? in_degree[cell] : undefined,
+		lake_index: (typeof lake_index !== "undefined") ? lake_index[cell] : undefined,
+	});
+}
+
+
+let mouse_x = 0;
+let mouse_y = 0;
+let mouse_in_window = true;
+document.addEventListener('mousemove', mouse_move);
+document.addEventListener('mouseleave', function(){ mouse_in_window = false; mouseElevationEl.innerHTML="";});
+document.addEventListener('mouseenter', function(){ mouse_in_window = true; });
+
+
+
+
+let animate_toggle=false;
+let auto_run = true;
+onkeydown = function(e)
+{
+	e.preventDefault();
+	const key = (e.key ?? "").toLowerCase();
+	console.log({ key, keyCode: e.keyCode });
+	auto_run = false;
+
+	// Case-insensitive letter handling.
+	if (key === "p") { paused = !paused; return; }
+	if (key === "g") { overlay_mode = (overlay_mode + 1) % 3; render(); return; }
+	if (key === "r") { reset_simulation(); return; }
+	if (key === "d") { debug_hovered_cell(); return; }
+	if (key === "s") { change_sea_level = !change_sea_level; return; }
+
+	// Step-size controls.
+	// Accept both shifted/unshifted punctuation variants.
+	if (key === "," || key === "<") { timestep = Math.max(100, Math.floor(timestep / 2)); return; }
+	if (key === "." || key === ">") { timestep = Math.min(5_000_000, timestep * 2); return; }
+
+	// Step presets.
+	if (key === " ") { animate_toggle = true; return; }
+	if (key === "1") { timestep = 50000; animate_toggle = true; return; }
+	if (key === "2") { timestep = 20000; animate_toggle = true; return; }
+	if (key === "3") { timestep = 5000; animate_toggle = true; return; }
+}
+onkeyup = function(){animate_toggle = false; }
+function animate(t)
+{
+	if (!paused)
+	{
+		if      (time < 4000000 && auto_run) step(50000);
+		else if (time < 4200000 && auto_run) step(20000);
+		else if (time < 4250000 && auto_run) step(5000);
+		else if (animate_toggle) step(timestep);
+	}
+	update_mouse();
+   requestAnimationFrame(animate);
+}
+animate();
+
+function draw_GL_relief()
+{
+   for (let i=0; i<cell_count; i++)
+   {
+      cell_elevation[i] = bedrock_thickness[i]+sediment_thickness[i];
+   }
+   draw_mesh(cell_elevation);
+}
+
+
+
+function mouse_move(event)
+{
+	let rect = mapCanvas.getBoundingClientRect();
+  mouse_x = event.clientX - rect.left;
+  mouse_y = event.clientY - rect.top;
+	mouseElevationEl.style.left = (event.clientX+20)+'px';
+	mouseElevationEl.style.top = (event.clientY+20)+'px';
+  update_mouse();
+}
+
+function update_mouse()
+{
+	function format_sim_time_years(years)
+	{
+		const absYears = Math.abs(years);
+		if (absYears < 10_000)
+		{
+			return `Time: ${Math.round(years).toLocaleString()} years`;
+		}
+		if (absYears < 1_000_000)
+		{
+			return `Time: ${(years / 1000).toFixed(1)} thousand years`;
+		}
+		return `Time: ${(years / 1_000_000).toFixed(2)} million years`;
+	}
+
+	dateReadoutEl.textContent = format_sim_time_years(time);
+
+   let cell = get_nearest_cell(mouse_x, mouse_y);
+   let text = "";
+   if (cell !== -1 && mouse_in_window)
+   {
+		const bedrock_m = bedrock_thickness[cell];
+		const sediment_m = sediment_thickness[cell];
+		const ground_m = cell_elevation[cell];
+		const water_m = lake_thickness[cell];
+		const surface_m = ground_m + water_m;
+		const surface_vs_sea_m = surface_m - sea_level;
+
+		let status = "";
+		if (water_m > lake_threshold) status = "Lake";
+		else if (surface_vs_sea_m >= 0) status = "Land";
+		else status = "Ocean";
+
+		const sign = surface_vs_sea_m >= 0 ? "+" : "";
+		const lines = [];
+		lines.push(`Cell ${cell} (${status})`);
+		lines.push(`Surface: ${surface_m.toFixed(1)} m  (${sign}${surface_vs_sea_m.toFixed(1)} m vs sea level)`);
+		lines.push(`Ground:  ${ground_m.toFixed(1)} m`);
+		if (water_m > 0.01) lines.push(`Water:   ${water_m.toFixed(1)} m`);
+		lines.push(`Bedrock: ${bedrock_m.toFixed(1)} m, Sediment: ${sediment_m.toFixed(1)} m`);
+		lines.push(`Sea level: ${sea_level.toFixed(1)} m`);
+		text = lines.join("\n");
+	}
+	mouseElevationEl.textContent = text;
+
+
+}
+</script>
