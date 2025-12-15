@@ -79,8 +79,10 @@
     }
   };
 
-  module.seed(Date.now());
-  //module.seed(0);
+  // Default seed. The app can override this later via `Noise.seed(seed)`.
+  // Using a fixed default keeps behavior deterministic when no override is applied.
+  module.seed(0);
+  //module.seed(Date.now());
 
   /*
   for(var i=0; i<256; i++) {
