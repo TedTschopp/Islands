@@ -733,6 +733,8 @@ function handle_sim_key(key)
 
 onkeydown = function(e)
 {
+	// Keep navigation and form controls independent of simulation shortcuts.
+	if (e.target instanceof Element && e.target.closest("tedt-global-header, input, textarea, select, button, a, [contenteditable]")) return;
 	e.preventDefault();
 	handle_sim_key(e.key);
 }
