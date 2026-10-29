@@ -102,3 +102,7 @@ If you’re changing the look (not the physics):
 - Open DevTools Console.
 - If you change any of the global arrays, re-run `initialize_drainage()` + `calculate_drainage_graph()` to rebuild flow.
 - If rendering looks wrong, confirm `triangle_count`, `triangle_vertices`, and `triangle_cells` exist (they’re created by `create_voronoi_tiling(...)`).
+
+## Shared TedT.org Navigation
+
+The global header loads `https://tedt.org/assets/global-header/v1/header.js`. Menu changes belong in the TedT.org repository, rather than in this site. The small local fallback and pre-paint bootstrap keep navigation and appearance usable while loading. The shared `tedt-appearance` cookie and `tedt:theme-change` event synchronize appearance; keep local site navigation and application controls separate. See https://tedt.org/docs/global-header.md for the embed contract.
