@@ -35,6 +35,10 @@ jobs:
         with:
           source: ./
           destination: ./_site
+      - name: Verify shared analytics coverage
+        run: |
+          python3 scripts/site_analytics.py _site --mode masked
+          python3 scripts/site_analytics.py _site --mode masked --check
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
 
