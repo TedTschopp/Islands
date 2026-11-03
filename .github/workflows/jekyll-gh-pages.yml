@@ -37,6 +37,7 @@ jobs:
           destination: ./_site
       - name: Verify shared analytics coverage
         run: |
+          sudo chown -R "$(id -u):$(id -g)" _site
           python3 scripts/site_analytics.py _site --mode masked
           python3 scripts/site_analytics.py _site --mode masked --check
       - name: Upload artifact
